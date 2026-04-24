@@ -11,6 +11,12 @@ from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
 load_dotenv()  # take environment variables from .env (especially openai api key)
 
+# Initialize session state early so sidebar logic can safely read it
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
+if 'simplified_mode' not in st.session_state:
+    st.session_state.simplified_mode = not os.environ.get("OPENAI_API_KEY")
+
 # Page configuration
 st.set_page_config(
     page_title="News Research Tool",
@@ -147,10 +153,12 @@ with st.sidebar:
     for i in range(3):
         url = st.text_input(f"URL {i+1}", key=f"url_{i}")
         if url:
+            clean_url = url.strip()
             # Simple URL validation
-            if not url.startswith(('http://', 'https://')):
+            if not clean_url.startswith(('http://', 'https://')):
                 st.warning(f"URL {i+1} should start with http:// or https://")
-            urls.append(url)
+            else:
+                urls.append(clean_url)
 
     # API Key input
     api_key = st.text_input("OpenAI API Key (optional)", type="password",
@@ -165,7 +173,11 @@ with st.sidebar:
     # Only show mode selection if API key is available
     if os.environ.get("OPENAI_API_KEY"):
         mode_options = ["OpenAI Mode (Better results)", "Simplified Mode (No API key)"]
-        selected_mode = st.radio("Select Mode:", mode_options, index=0 if not st.session_state.simplified_mode else 1)
+        selected_mode = st.radio(
+            "Select Mode:",
+            mode_options,
+            index=0 if not st.session_state.get("simplified_mode", False) else 1
+        )
 
         # Update session state based on selection
         st.session_state.simplified_mode = (selected_mode == mode_options[1])
@@ -198,12 +210,6 @@ with st.sidebar:
 # Main content
 file_path = "vector_index.pkl"
 
-# Initialize session state
-if 'processing_complete' not in st.session_state:
-    st.session_state.processing_complete = False
-if 'simplified_mode' not in st.session_state:
-    st.session_state.simplified_mode = not os.environ.get("OPENAI_API_KEY")
-
 # Main content area
 main_container = st.container()
 
@@ -213,13 +219,10 @@ with main_container:
         if not urls or all(url == "" for url in urls):
             st.error("Please enter at least one valid URL")
         else:
-            # Check for API key
-            if not os.environ.get("OPENAI_API_KEY"):
-                st.warning("OpenAI API key is missing. The app will use a simplified mode without OpenAI features.")
-                # Set a flag in session state to indicate we're in simplified mode
+            # Respect selected mode; only force simplified if OpenAI mode is selected without key
+            if not st.session_state.simplified_mode and not os.environ.get("OPENAI_API_KEY"):
+                st.warning("OpenAI API key is missing. Falling back to simplified mode.")
                 st.session_state.simplified_mode = True
-            else:
-                st.session_state.simplified_mode = False
 
             try:
                 # Create a progress bar
