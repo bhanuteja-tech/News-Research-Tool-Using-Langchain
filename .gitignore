@@ -48,3 +48,11 @@ vector_index.pkl
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Local image files (temporary/test assets)
+image
+image-1
+image-2
+image-3
+image*
+

@@ -1,15 +1,78 @@
 import os
 import streamlit as st
 import pickle
+import requests
 from langchain_community.llms import OpenAI
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import UnstructuredURLLoader
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
+from bs4 import BeautifulSoup
+from langchain.schema import Document
 
 from dotenv import load_dotenv
 load_dotenv()  # take environment variables from .env (especially openai api key)
+
+
+def _extract_text_with_fallback(urls):
+    """
+    Robust URL text extraction for deployments where UnstructuredURLLoader
+    can fail due to anti-bot checks or dynamic markup.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    extracted_docs = []
+    failed_urls = []
+
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Remove non-content noise early
+            for tag in soup(["script", "style", "noscript", "svg", "footer", "nav", "aside"]):
+                tag.decompose()
+
+            # Prefer common article containers first
+            preferred_selectors = [
+                "article",
+                "main",
+                '[role="main"]',
+                ".article-body",
+                ".story-body",
+                ".post-content",
+                ".entry-content",
+            ]
+            text = ""
+            for selector in preferred_selectors:
+                node = soup.select_one(selector)
+                if node:
+                    text = node.get_text(separator=" ", strip=True)
+                    if len(text) > 300:
+                        break
+
+            # Fallback to entire page text when article container is missing
+            if len(text) <= 300:
+                text = soup.get_text(separator=" ", strip=True)
+
+            # Normalize whitespace and keep useful content only
+            text = " ".join(text.split())
+            if len(text) > 300:
+                extracted_docs.append(Document(page_content=text, metadata={"source": url}))
+            else:
+                failed_urls.append(url)
+        except Exception:
+            failed_urls.append(url)
+
+    return extracted_docs, failed_urls
 
 # Initialize session state early so sidebar logic can safely read it
 if 'processing_complete' not in st.session_state:
@@ -241,7 +304,16 @@ with main_container:
                         loader = UnstructuredURLLoader(urls=valid_urls)
                         data = loader.load()
                         if not data:
-                            st.error("Could not extract any content from the provided URLs. Please check if the URLs are accessible and contain readable content.")
+                            # Retry with a fallback HTML extraction path
+                            data, failed_urls = _extract_text_with_fallback(valid_urls)
+                            if failed_urls:
+                                st.warning(
+                                    "Could not extract content from: "
+                                    + ", ".join(failed_urls[:3])
+                                    + (" ..." if len(failed_urls) > 3 else "")
+                                )
+                        if not data:
+                            st.error("Could not extract any content from the provided URLs. Please try direct article links and avoid home/topic pages.")
                         else:
                             progress_bar.progress(25)
 
@@ -287,8 +359,52 @@ with main_container:
                             status_text.markdown("<div class='success-box'>✅ Processing complete! You can now ask questions about the articles.</div>", unsafe_allow_html=True)
                             st.session_state.processing_complete = True
                     except Exception as e:
-                        st.error(f"Error loading URLs: {str(e)}")
-                        st.info("Tips: Make sure the URLs are accessible and point to text-based content (not PDFs or images).")
+                        # If primary loader fails (common in cloud deployments), use fallback extraction
+                        data, failed_urls = _extract_text_with_fallback(valid_urls)
+                        if not data:
+                            st.error(f"Error loading URLs: {str(e)}")
+                            st.info("Tips: Make sure the URLs are accessible and point to text-based content (not PDFs or images).")
+                        else:
+                            if failed_urls:
+                                st.warning(
+                                    "Some URLs could not be extracted: "
+                                    + ", ".join(failed_urls[:3])
+                                    + (" ..." if len(failed_urls) > 3 else "")
+                                )
+                            progress_bar.progress(25)
+
+                            status_text.markdown("<div class='info-box'>Step 2/4: Splitting text into chunks...</div>", unsafe_allow_html=True)
+                            text_splitter = RecursiveCharacterTextSplitter(
+                                separators=['\n\n', '\n', '.', ','],
+                                chunk_size=1000
+                            )
+                            docs = text_splitter.split_documents(data)
+                            progress_bar.progress(50)
+
+                            if st.session_state.simplified_mode:
+                                status_text.markdown("<div class='info-box'>Step 3/4: Processing text (simplified mode)...</div>", unsafe_allow_html=True)
+                                progress_bar.progress(75)
+
+                                status_text.markdown("<div class='info-box'>Step 4/4: Saving processed data...</div>", unsafe_allow_html=True)
+                                with open("processed_docs.pkl", "wb") as f:
+                                    pickle.dump(docs, f)
+                                with open("processed_urls.txt", "w") as f:
+                                    f.write("\n".join(valid_urls))
+                                progress_bar.progress(100)
+                                st.session_state.simplified_file_path = "processed_docs.pkl"
+                            else:
+                                status_text.markdown("<div class='info-box'>Step 3/4: Creating embeddings...</div>", unsafe_allow_html=True)
+                                embeddings = OpenAIEmbeddings()
+                                vectorstore_openai = FAISS.from_documents(docs, embeddings)
+                                progress_bar.progress(75)
+
+                                status_text.markdown("<div class='info-box'>Step 4/4: Saving knowledge base...</div>", unsafe_allow_html=True)
+                                with open(file_path, "wb") as f:
+                                    pickle.dump(vectorstore_openai, f)
+                                progress_bar.progress(100)
+
+                            status_text.markdown("<div class='success-box'>✅ Processing complete! You can now ask questions about the articles.</div>", unsafe_allow_html=True)
+                            st.session_state.processing_complete = True
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
 
