@@ -101,6 +101,141 @@ def _extract_text_with_fallback(urls):
     return extracted_docs, failed_urls
 
 
+def _extract_source_url(doc):
+    """
+    Return a normalized source URL for a document chunk.
+    """
+    if not hasattr(doc, "metadata") or not isinstance(doc.metadata, dict):
+        return "Unknown source"
+    return (
+        doc.metadata.get("source")
+        or doc.metadata.get("url")
+        or doc.metadata.get("source_url")
+        or "Unknown source"
+    )
+
+
+def _merge_missing_urls_with_fallback(data, valid_urls):
+    """
+    Ensure content exists for as many input URLs as possible.
+    If primary loader misses some sources, fetch only the missing URLs via fallback.
+    """
+    loaded_sources = set()
+    for doc in data:
+        src = _extract_source_url(doc)
+        if src and src != "Unknown source":
+            loaded_sources.add(src)
+
+    missing_urls = [u for u in valid_urls if u not in loaded_sources]
+    if not missing_urls:
+        return data, []
+
+    fallback_docs, failed_urls = _extract_text_with_fallback(missing_urls)
+    if fallback_docs:
+        data.extend(fallback_docs)
+    return data, failed_urls
+
+
+def _select_diverse_docs(retrieved_docs, max_docs=8, max_per_source=2):
+    """
+    Pick relevant chunks while preventing one URL from dominating context.
+    """
+    if not retrieved_docs:
+        return []
+
+    selected = []
+    per_source = {}
+
+    for doc in retrieved_docs:
+        source = _extract_source_url(doc)
+        current = per_source.get(source, 0)
+        if current >= max_per_source:
+            continue
+        selected.append(doc)
+        per_source[source] = current + 1
+        if len(selected) >= max_docs:
+            break
+
+    return selected
+
+
+def _looks_like_non_article_url(url):
+    """
+    Heuristic check for homepage/section URLs that usually produce noisy context.
+    """
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or "").strip("/").lower()
+        if not path:
+            return True
+        non_article_paths = {
+            "news", "latest", "top-news", "world", "business", "markets", "sports",
+            "technology", "tech", "politics", "india", "us", "uk",
+        }
+        return path in non_article_paths and path.count("/") == 0
+    except Exception:
+        return False
+
+
+def _load_expected_sources_from_session_or_disk():
+    """
+    Return URL sources that should be represented in retrieval.
+    """
+    expected = st.session_state.get("last_processing_debug", {}).get("loaded_sources", []) or []
+    if expected:
+        return expected
+
+    if os.path.exists("processed_urls.txt"):
+        try:
+            with open("processed_urls.txt", "r", encoding="utf-8") as f:
+                return [line.strip() for line in f.readlines() if line.strip()]
+        except Exception:
+            return []
+    return []
+
+
+def _retrieve_with_source_coverage(vectorstore, query, expected_sources, per_source_k=2, total_k=8):
+    """
+    Retrieve chunks by enforcing per-source coverage first, then fill remaining slots.
+    """
+    selected = []
+    seen_ids = set()
+    covered_sources = []
+
+    for source in expected_sources:
+        try:
+            per_source_docs = vectorstore.similarity_search(
+                query,
+                k=per_source_k,
+                filter={"source": source},
+            )
+        except Exception:
+            per_source_docs = []
+
+        for doc in per_source_docs:
+            doc_id = f"{_extract_source_url(doc)}::{hash(doc.page_content[:300])}"
+            if doc_id in seen_ids:
+                continue
+            selected.append(doc)
+            seen_ids.add(doc_id)
+
+        if per_source_docs:
+            covered_sources.append(source)
+
+    if len(selected) < total_k:
+        fallback_docs = vectorstore.max_marginal_relevance_search(query, k=24, fetch_k=64)
+        for doc in fallback_docs:
+            doc_id = f"{_extract_source_url(doc)}::{hash(doc.page_content[:300])}"
+            if doc_id in seen_ids:
+                continue
+            selected.append(doc)
+            seen_ids.add(doc_id)
+            if len(selected) >= total_k:
+                break
+
+    return selected[:total_k], covered_sources
+
+
 def _generate_suggested_questions(urls, docs, n=5):
     """
     Build a small set of user-facing sample questions from processed content.
@@ -179,6 +314,10 @@ if 'simplified_mode' not in st.session_state:
     st.session_state.simplified_mode = not os.environ.get("OPENAI_API_KEY")
 if 'suggested_questions' not in st.session_state:
     st.session_state.suggested_questions = []
+if 'last_processing_debug' not in st.session_state:
+    st.session_state.last_processing_debug = {}
+if 'last_retrieval_debug' not in st.session_state:
+    st.session_state.last_retrieval_debug = {}
 
 # Recover suggestions on reruns so users always see question ideas after processing.
 if not st.session_state.get("suggested_questions"):
@@ -401,15 +540,30 @@ with main_container:
 
                 # Filter out empty URLs
                 valid_urls = [url for url in urls if url.strip() != ""]
+                non_article_urls = [u for u in valid_urls if _looks_like_non_article_url(u)]
 
                 if not valid_urls:
                     st.error("No valid URLs provided. Please enter at least one valid URL.")
                 else:
+                    if non_article_urls:
+                        st.warning(
+                            "Some URLs look like home/section pages and may reduce answer relevance: "
+                            + ", ".join(non_article_urls[:3])
+                            + (" ..." if len(non_article_urls) > 3 else "")
+                            + ". Prefer direct article URLs."
+                        )
                     status_text.markdown("<div class='info-box'>Step 1/4: Loading data from URLs...</div>", unsafe_allow_html=True)
                     # Load data
                     try:
                         loader = UnstructuredURLLoader(urls=valid_urls)
                         data = loader.load()
+                        data, failed_urls = _merge_missing_urls_with_fallback(data, valid_urls)
+                        if failed_urls:
+                            st.warning(
+                                "Could not extract content from: "
+                                + ", ".join(failed_urls[:3])
+                                + (" ..." if len(failed_urls) > 3 else "")
+                            )
                         if not data:
                             # Retry with a fallback HTML extraction path
                             data, failed_urls = _extract_text_with_fallback(valid_urls)
@@ -422,6 +576,11 @@ with main_container:
                         if not data:
                             st.error("Could not extract any content from the provided URLs. Please try direct article links and avoid home/topic pages.")
                         else:
+                            loaded_sources = []
+                            for d in data:
+                                src = _extract_source_url(d)
+                                if src not in loaded_sources and src != "Unknown source":
+                                    loaded_sources.append(src)
                             progress_bar.progress(25)
 
                             status_text.markdown("<div class='info-box'>Step 2/4: Splitting text into chunks...</div>", unsafe_allow_html=True)
@@ -431,6 +590,12 @@ with main_container:
                                 chunk_size=1000
                             )
                             docs = text_splitter.split_documents(data)
+                            st.session_state.last_processing_debug = {
+                                "input_urls": valid_urls,
+                                "loaded_sources": loaded_sources,
+                                "failed_urls": failed_urls,
+                                "total_docs": len(docs),
+                            }
                             progress_bar.progress(50)
 
                             # Check if we're in simplified mode
@@ -494,6 +659,17 @@ with main_container:
                                 chunk_size=1000
                             )
                             docs = text_splitter.split_documents(data)
+                            loaded_sources = []
+                            for d in data:
+                                src = _extract_source_url(d)
+                                if src not in loaded_sources and src != "Unknown source":
+                                    loaded_sources.append(src)
+                            st.session_state.last_processing_debug = {
+                                "input_urls": valid_urls,
+                                "loaded_sources": loaded_sources,
+                                "failed_urls": failed_urls,
+                                "total_docs": len(docs),
+                            }
                             progress_bar.progress(50)
 
                             if st.session_state.simplified_mode:
@@ -532,6 +708,63 @@ with main_container:
 
     # Divider
     st.markdown("---")
+
+    # Debug information panel
+    with st.expander("Debug: URL ingestion and retrieval"):
+        processing_debug = st.session_state.get("last_processing_debug", {})
+        retrieval_debug = st.session_state.get("last_retrieval_debug", {})
+
+        if not processing_debug and not retrieval_debug:
+            st.markdown("No debug data yet. Process URLs and ask a question to populate this panel.")
+        else:
+            if processing_debug:
+                st.markdown("**Last processing run**")
+                input_urls = processing_debug.get("input_urls", [])
+                loaded_sources = processing_debug.get("loaded_sources", [])
+                failed_urls = processing_debug.get("failed_urls", [])
+                total_docs = processing_debug.get("total_docs", 0)
+
+                st.markdown(f"- Input URLs: {len(input_urls)}")
+                st.markdown(f"- Sources loaded: {len(loaded_sources)}")
+                st.markdown(f"- Total chunks created: {total_docs}")
+
+                if input_urls:
+                    st.markdown("Input URLs:")
+                    for u in input_urls:
+                        st.markdown(f"- {u}")
+
+                if loaded_sources:
+                    st.markdown("Loaded sources:")
+                    for s in loaded_sources:
+                        st.markdown(f"- {s}")
+
+                if failed_urls:
+                    st.markdown("Failed URLs:")
+                    for f in failed_urls:
+                        st.markdown(f"- {f}")
+
+            if retrieval_debug:
+                st.markdown("**Last answer retrieval**")
+                query_text = retrieval_debug.get("query", "")
+                retrieved_sources = retrieval_debug.get("retrieved_sources", [])
+                raw_hits = retrieval_debug.get("raw_hits", 0)
+                selected_hits = retrieval_debug.get("selected_hits", 0)
+                expected_sources = retrieval_debug.get("expected_sources", [])
+                covered_sources = retrieval_debug.get("covered_sources", [])
+
+                if query_text:
+                    st.markdown(f"- Query: `{query_text}`")
+                st.markdown(f"- Retrieved chunks (after targeted retrieval + fill): {raw_hits}")
+                st.markdown(f"- Chunks sent to model: {selected_hits}")
+                if expected_sources:
+                    st.markdown(f"- Expected sources: {len(expected_sources)}")
+                if covered_sources:
+                    st.markdown(f"- Sources covered by targeted retrieval: {len(covered_sources)}")
+
+                if retrieved_sources:
+                    st.markdown("Sources used in answer:")
+                    for s in retrieved_sources:
+                        st.markdown(f"- {s}")
 
     # Q&A Section
     st.markdown("<h2 class='subheader'>Ask Questions About the Articles</h2>", unsafe_allow_html=True)
@@ -643,17 +876,42 @@ with main_container:
 
                         # Retrieve top relevant chunks and ask the chat model directly.
                         # This avoids provider-specific chain parsing issues with OpenRouter.
-                        retrieved_docs = vectorstore.similarity_search(query, k=3)
+                        expected_sources = _load_expected_sources_from_session_or_disk()
+                        retrieved_docs, covered_sources = _retrieve_with_source_coverage(
+                            vectorstore,
+                            query,
+                            expected_sources=expected_sources,
+                            per_source_k=2,
+                            total_k=8,
+                        )
+                        raw_retrieved_count = len(retrieved_docs)
                         context_blocks = []
                         source_urls = []
                         for i, doc in enumerate(retrieved_docs, start=1):
-                            context_blocks.append(f"[Source {i}]\n{doc.page_content}")
-                            if hasattr(doc, "metadata") and doc.metadata.get("source"):
-                                source_urls.append(doc.metadata.get("source"))
+                            source_url = _extract_source_url(doc)
+                            context_blocks.append(f"[Source {i} | {source_url}]\n{doc.page_content}")
+                            if source_url and source_url != "Unknown source":
+                                source_urls.append(source_url)
+                        unique_retrieved_sources = []
+                        for src in source_urls:
+                            if src not in unique_retrieved_sources:
+                                unique_retrieved_sources.append(src)
+                        st.session_state.last_retrieval_debug = {
+                            "query": query,
+                            "raw_hits": raw_retrieved_count,
+                            "selected_hits": len(retrieved_docs),
+                            "retrieved_sources": unique_retrieved_sources,
+                            "expected_sources": expected_sources,
+                            "covered_sources": covered_sources,
+                        }
 
                         prompt = (
-                            "You are a helpful research assistant. Answer the question using only the context below. "
-                            "If the context is insufficient, say what is missing.\n\n"
+                            "You are a helpful research assistant. Answer the question using only the context below.\n"
+                            "Rules:\n"
+                            "1) Give a concise direct answer first.\n"
+                            "2) Then provide a short 'By source' section.\n"
+                            "3) If a source is missing relevant evidence, say so explicitly.\n"
+                            "4) Do not invent facts outside context.\n\n"
                             f"Question: {query}\n\n"
                             "Context:\n"
                             + "\n\n".join(context_blocks)
