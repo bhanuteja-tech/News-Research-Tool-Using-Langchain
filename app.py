@@ -236,6 +236,25 @@ def _retrieve_with_source_coverage(vectorstore, query, expected_sources, per_sou
     return selected[:total_k], covered_sources
 
 
+def _balance_docs_by_source(docs, max_chunks_per_source=30):
+    """
+    Limit over-represented sources so one URL doesn't dominate the knowledge base.
+    """
+    if not docs:
+        return docs
+
+    balanced = []
+    per_source_count = {}
+    for doc in docs:
+        source = _extract_source_url(doc)
+        count = per_source_count.get(source, 0)
+        if count >= max_chunks_per_source:
+            continue
+        balanced.append(doc)
+        per_source_count[source] = count + 1
+    return balanced
+
+
 def _generate_suggested_questions(urls, docs, n=5):
     """
     Build a small set of user-facing sample questions from processed content.
@@ -590,11 +609,17 @@ with main_container:
                                 chunk_size=1000
                             )
                             docs = text_splitter.split_documents(data)
+                            docs = _balance_docs_by_source(docs, max_chunks_per_source=30)
+                            chunk_count_by_source = {}
+                            for d in docs:
+                                src = _extract_source_url(d)
+                                chunk_count_by_source[src] = chunk_count_by_source.get(src, 0) + 1
                             st.session_state.last_processing_debug = {
                                 "input_urls": valid_urls,
                                 "loaded_sources": loaded_sources,
                                 "failed_urls": failed_urls,
                                 "total_docs": len(docs),
+                                "chunk_count_by_source": chunk_count_by_source,
                             }
                             progress_bar.progress(50)
 
@@ -659,16 +684,22 @@ with main_container:
                                 chunk_size=1000
                             )
                             docs = text_splitter.split_documents(data)
+                            docs = _balance_docs_by_source(docs, max_chunks_per_source=30)
                             loaded_sources = []
                             for d in data:
                                 src = _extract_source_url(d)
                                 if src not in loaded_sources and src != "Unknown source":
                                     loaded_sources.append(src)
+                            chunk_count_by_source = {}
+                            for d in docs:
+                                src = _extract_source_url(d)
+                                chunk_count_by_source[src] = chunk_count_by_source.get(src, 0) + 1
                             st.session_state.last_processing_debug = {
                                 "input_urls": valid_urls,
                                 "loaded_sources": loaded_sources,
                                 "failed_urls": failed_urls,
                                 "total_docs": len(docs),
+                                "chunk_count_by_source": chunk_count_by_source,
                             }
                             progress_bar.progress(50)
 
@@ -723,6 +754,7 @@ with main_container:
                 loaded_sources = processing_debug.get("loaded_sources", [])
                 failed_urls = processing_debug.get("failed_urls", [])
                 total_docs = processing_debug.get("total_docs", 0)
+                chunk_count_by_source = processing_debug.get("chunk_count_by_source", {})
 
                 st.markdown(f"- Input URLs: {len(input_urls)}")
                 st.markdown(f"- Sources loaded: {len(loaded_sources)}")
@@ -737,6 +769,11 @@ with main_container:
                     st.markdown("Loaded sources:")
                     for s in loaded_sources:
                         st.markdown(f"- {s}")
+
+                if chunk_count_by_source:
+                    st.markdown("Chunk count by source:")
+                    for src, cnt in chunk_count_by_source.items():
+                        st.markdown(f"- {src}: {cnt}")
 
                 if failed_urls:
                     st.markdown("Failed URLs:")
